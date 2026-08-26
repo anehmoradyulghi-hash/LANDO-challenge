@@ -1,0 +1,374 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// =========================================================
+// USERS  (section 4)
+// =========================================================
+model User {
+  id             String   @id @default(cuid())
+  telegramUserId BigInt   @unique @map("telegram_user_id")
+  username       String?
+  firstName      String?  @map("first_name")
+  lastName       String?  @map("last_name")
+  languageCode   String?  @map("language_code")
+  isBot          Boolean  @default(false) @map("is_bot")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  channels        Channel[]              @relation("ChannelOwner")
+  challenges      Challenge[]            @relation("ChallengeCreator")
+  participations  ChallengeParticipant[]
+  points          ChallengePoint[]
+  referralsMade   Referral[]             @relation("Referrer")
+  referralsGotten Referral[]             @relation("Referred")
+  tickets         GiveawayTicket[]
+  wins            ChallengeWinner[]
+  wizardSessions  WizardSession[]
+
+  @@map("users")
+}
+
+// =========================================================
+// CHANNELS  (sections 7-10)
+// =========================================================
+enum ChannelAccessStatus {
+  OK
+  BOT_NOT_ADMIN
+  BOT_NO_POST_PERMISSION
+  OWNER_NOT_ADMIN
+  NOT_FOUND
+  UNKNOWN_ERROR
+}
+
+model Channel {
+  id              String              @id @default(cuid())
+  ownerId         String              @map("owner_id")
+  owner           User                @relation("ChannelOwner", fields: [ownerId], references: [id])
+  telegramChatId  BigInt              @map("telegram_chat_id")
+  username        String?
+  title           String?
+  accessStatus    ChannelAccessStatus @default(UNKNOWN_ERROR) @map("access_status")
+  lastCheckedAt   DateTime?           @map("last_checked_at")
+  isDeleted       Boolean             @default(false) @map("is_deleted") // soft delete: keep historical links (section 7)
+  createdAt       DateTime            @default(now()) @map("created_at")
+  updatedAt       DateTime            @updatedAt @map("updated_at")
+
+  primaryOfChallenges  Challenge[]          @relation("PrimaryChannel")
+  requiredInChallenges ChallengeChannel[]
+  posts                ChallengePost[]
+
+  @@unique([ownerId, telegramChatId])
+  @@index([telegramChatId])
+  @@map("channels")
+}
+
+// =========================================================
+// CHALLENGES  (sections 11-27, 45-48)
+// =========================================================
+enum ChallengeType {
+  LEADERBOARD
+  GIVEAWAY
+  REFERRAL
+  ACTIVITY
+}
+
+enum ChallengeStatus {
+  DRAFT
+  SCHEDULED
+  ACTIVE
+  ENDING
+  ENDED
+  SETTLED
+  CANCELLED
+}
+
+enum PrizeMode {
+  NONE
+  EQUAL
+  RANKED
+}
+
+enum WinnerSelectionMode {
+  RANKED   // leaderboard: top-N by points
+  RANDOM   // giveaway: uniform random
+  WEIGHTED // giveaway: ticket-weighted random
+}
+
+model Challenge {
+  id          String          @id @default(cuid())
+  publicToken String          @unique @map("public_token") // section 6: never expose internal id
+  creatorId   String          @map("creator_id")
+  creator     User            @relation("ChallengeCreator", fields: [creatorId], references: [id])
+
+  channelId   String          @map("channel_id") // "home" channel that owns the challenge
+  channel     Channel         @relation("PrimaryChannel", fields: [channelId], references: [id])
+
+  name        String
+  description String?
+  rules       String?
+
+  type        ChallengeType
+  status      ChallengeStatus @default(DRAFT)
+
+  startAt     DateTime        @map("start_at")
+  endAt       DateTime        @map("end_at")
+
+  // Scoring (section 27) - only meaningful for LEADERBOARD / ACTIVITY
+  pointsJoin           Int @default(10) @map("points_join")
+  pointsVerifiedReferral Int @default(20) @map("points_verified_referral")
+  pointsBonus          Int @default(0) @map("points_bonus")
+
+  // Referral (section 34-37)
+  referralEnabled Boolean @default(true) @map("referral_enabled")
+
+  // Ticket (section 37-39) - only meaningful for GIVEAWAY
+  ticketEnabled       Boolean @default(false) @map("ticket_enabled")
+  ticketsPerReferral  Int     @default(1) @map("tickets_per_referral")
+
+  // Winner (sections 15-23, 46-47)
+  winnerEnabled Boolean             @default(false) @map("winner_enabled")
+  winnerCount   Int?                @map("winner_count")
+  selectionMode WinnerSelectionMode?@map("selection_mode")
+
+  // Prize (sections 17,22,23)
+  prizeMode  PrizeMode @default(NONE) @map("prize_mode")
+  prizeEqualAmount Int? @map("prize_equal_amount") // used when prizeMode = EQUAL
+  prizeRankedTable Json? @map("prize_ranked_table") // used when prizeMode = RANKED: [{rank:1, amount:200}, ...]
+
+  maxRequiredChannels Int @default(20) @map("max_required_channels")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+  settledAt DateTime? @map("settled_at")
+
+  requiredChannels ChallengeChannel[]
+  participants     ChallengeParticipant[]
+  points           ChallengePoint[]
+  referrals        Referral[]
+  tickets          GiveawayTicket[]
+  posts            ChallengePost[]
+  winners          ChallengeWinner[]
+
+  @@index([status])
+  @@index([creatorId])
+  @@map("challenges")
+}
+
+// Required channels for a challenge (many-to-many, section 9-10)
+model ChallengeChannel {
+  id          String    @id @default(cuid())
+  challengeId String    @map("challenge_id")
+  challenge   Challenge @relation(fields: [challengeId], references: [id], onDelete: Cascade)
+  channelId   String    @map("channel_id")
+  channel     Channel   @relation(fields: [channelId], references: [id])
+  createdAt   DateTime  @default(now()) @map("created_at")
+
+  @@unique([challengeId, channelId]) // section 9: duplicate channel forbidden
+  @@map("challenge_channels")
+}
+
+// =========================================================
+// PARTICIPANTS  (section 29)
+// =========================================================
+enum ParticipantStatus {
+  PENDING_MEMBERSHIP
+  ACTIVE
+  DISQUALIFIED
+}
+
+enum FraudStatus {
+  CLEAN
+  SUSPECT
+  BLOCKED
+}
+
+model ChallengeParticipant {
+  id                String            @id @default(cuid())
+  challengeId       String            @map("challenge_id")
+  challenge         Challenge         @relation(fields: [challengeId], references: [id], onDelete: Cascade)
+  userId            String            @map("user_id")
+  user              User              @relation(fields: [userId], references: [id])
+  status            ParticipantStatus @default(PENDING_MEMBERSHIP)
+  joinedAt          DateTime?         @map("joined_at")
+  totalPoints       Int               @default(0) @map("total_points")
+  verifiedReferrals Int               @default(0) @map("verified_referrals")
+  ticketCount       Int               @default(0) @map("ticket_count")
+  fraudStatus       FraudStatus       @default(CLEAN) @map("fraud_status")
+  lastVerifiedAt    DateTime?         @map("last_verified_at")
+
+  @@unique([challengeId, userId]) // section 29
+  @@index([challengeId, totalPoints])
+  @@map("challenge_participants")
+}
+
+// =========================================================
+// POINT LEDGER  (section 28)
+// =========================================================
+enum PointType {
+  JOIN_CHALLENGE
+  REFERRAL
+  BONUS
+}
+
+model ChallengePoint {
+  id          String    @id @default(cuid())
+  challengeId String    @map("challenge_id")
+  challenge   Challenge @relation(fields: [challengeId], references: [id], onDelete: Cascade)
+  userId      String    @map("user_id")
+  user        User      @relation(fields: [userId], references: [id])
+  type        PointType
+  points      Int
+  referenceId String?   @map("reference_id") // e.g. referral id, dedupe key
+  metadata    Json?
+  createdAt   DateTime  @default(now()) @map("created_at")
+
+  // Prevents double-crediting the same event (section 28: "Duplicate Point جلوگیری شود")
+  @@unique([challengeId, userId, type, referenceId])
+  @@map("challenge_points")
+}
+
+// =========================================================
+// REFERRALS  (sections 34-36)
+// =========================================================
+enum ReferralStatus {
+  PENDING
+  JOINED
+  VERIFIED
+  INVALID
+}
+
+model Referral {
+  id            String         @id @default(cuid())
+  challengeId   String         @map("challenge_id")
+  challenge     Challenge      @relation(fields: [challengeId], references: [id], onDelete: Cascade)
+  referrerId    String         @map("referrer_id")
+  referrer      User           @relation("Referrer", fields: [referrerId], references: [id])
+  referredId    String         @map("referred_id")
+  referred      User           @relation("Referred", fields: [referredId], references: [id])
+  status        ReferralStatus @default(PENDING)
+  verifiedAt    DateTime?      @map("verified_at")
+  createdAt     DateTime       @default(now()) @map("created_at")
+
+  ticket GiveawayTicket?
+
+  @@unique([challengeId, referredId]) // section 35: a user has exactly one referrer per challenge
+  @@index([challengeId, referrerId])
+  @@map("referrals")
+}
+
+// =========================================================
+// TICKETS  (sections 37-39)
+// =========================================================
+enum TicketStatus {
+  ACTIVE
+  INVALIDATED
+}
+
+enum TicketSource {
+  REFERRAL
+  BONUS
+}
+
+model GiveawayTicket {
+  id          String       @id @default(cuid())
+  challengeId String       @map("challenge_id")
+  challenge   Challenge    @relation(fields: [challengeId], references: [id], onDelete: Cascade)
+  userId      String       @map("user_id")
+  user        User         @relation(fields: [userId], references: [id])
+  referralId  String?      @unique @map("referral_id") // section 38: one referral -> one ticket grant
+  referral    Referral?    @relation(fields: [referralId], references: [id])
+  amount      Int
+  source      TicketSource
+  status      TicketStatus @default(ACTIVE)
+  createdAt   DateTime     @default(now()) @map("created_at")
+
+  @@index([challengeId, userId])
+  @@map("giveaway_tickets")
+}
+
+// =========================================================
+// POSTS  (sections 49-53)
+// =========================================================
+enum PostStatus {
+  PENDING
+  PUBLISHED
+  FAILED
+}
+
+model ChallengePost {
+  id                String     @id @default(cuid())
+  challengeId       String     @map("challenge_id")
+  challenge         Challenge  @relation(fields: [challengeId], references: [id], onDelete: Cascade)
+  channelId         String     @map("channel_id")
+  channel           Channel    @relation(fields: [channelId], references: [id])
+  telegramMessageId BigInt?    @map("telegram_message_id")
+  status            PostStatus @default(PENDING)
+  lastError         String?    @map("last_error")
+  lastParticipantCountShown Int @default(0) @map("last_participant_count_shown")
+  lastEditedAt      DateTime?  @map("last_edited_at")
+  createdAt         DateTime   @default(now()) @map("created_at")
+  updatedAt         DateTime   @updatedAt @map("updated_at")
+
+  @@unique([challengeId, channelId])
+  @@map("challenge_posts")
+}
+
+// =========================================================
+// WINNERS
+// =========================================================
+model ChallengeWinner {
+  id          String    @id @default(cuid())
+  challengeId String    @map("challenge_id")
+  challenge   Challenge @relation(fields: [challengeId], references: [id], onDelete: Cascade)
+  userId      String    @map("user_id")
+  user        User      @relation(fields: [userId], references: [id])
+  rank        Int
+  prizeAmount Int?      @map("prize_amount")
+  announcedAt DateTime? @map("announced_at")
+  createdAt   DateTime  @default(now()) @map("created_at")
+
+  @@unique([challengeId, userId])
+  @@unique([challengeId, rank])
+  @@map("challenge_winners")
+}
+
+// =========================================================
+// WIZARD SESSION (section 12) - persisted so a restart never loses progress
+// =========================================================
+model WizardSession {
+  id         String   @id @default(cuid())
+  userId     String   @map("user_id")
+  user       User     @relation(fields: [userId], references: [id])
+  step       String
+  draft      Json     // partial Challenge + requiredChannels being built
+  challengeId String? @map("challenge_id") // set once the draft Challenge row exists
+  createdAt  DateTime @default(now()) @map("created_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+  expiresAt  DateTime @map("expires_at")
+
+  @@unique([userId]) // one active wizard session per user at a time (section 12)
+  @@map("wizard_sessions")
+}
+
+// =========================================================
+// PENDING TEXT INPUT - generic "bot is waiting for a free-text reply" state,
+// used for things outside the challenge wizard (e.g. "send me the channel @username",
+// section 8) as well as free-text wizard steps (name/description/custom date/etc).
+// Persisted so it also survives a restart, same rationale as WizardSession (section 12).
+// =========================================================
+model PendingTextInput {
+  id        String   @id @default(cuid())
+  userId    String   @unique @map("user_id")
+  purpose   String // e.g. "ADD_CHANNEL", "WIZARD_NAME", "WIZARD_CUSTOM_START", ...
+  payload   Json?
+  createdAt DateTime @default(now()) @map("created_at")
+  expiresAt DateTime @map("expires_at")
+
+  @@map("pending_text_inputs")
+}
